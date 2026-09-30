@@ -303,10 +303,14 @@ export interface BackendInstanceSpec {
   // manager should resolve once more; false stops the failed instance.
   readonly onPreflightFailed?: (failure: PreflightFailure) => Effect.Effect<boolean>;
   // Fired each time MAX_STARTUP_FAILURE_ATTEMPTS consecutive startup failures
-  // accumulate after a clean preflight. Returns true when the callback changed
-  // configuration and the manager should replace the current run; false keeps
-  // the normal restart and readiness loops going.
-  readonly onStartupFailed?: (reason: string) => Effect.Effect<boolean>;
+  // accumulate after a clean preflight, with the config the failing run used.
+  // Returns true when the callback changed configuration and the manager
+  // should replace the current run; false keeps the normal restart and
+  // readiness loops going.
+  readonly onStartupFailed?: (
+    reason: string,
+    config: DesktopBackendStartConfig,
+  ) => Effect.Effect<boolean>;
 }
 
 interface ActiveBackendRun {
@@ -912,7 +916,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               if (isCurrentRun && exitObserved && !stopRequested && !wasReady) {
                 // The restart below re-resolves config, so the hook's answer
                 // needs no extra handling here.
-                yield* recordStartupFailure(reason);
+                yield* recordStartupFailure(reason, config.value);
               }
               if (isCurrentRun && nextState.desiredRunning) {
                 yield* scheduleRestart(reason);
@@ -983,7 +987,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               // Stopping the run interrupts the pending hook. The replacement
               // goes to the instance scope because it closes this run's scope.
               yield* Effect.forkIn(
-                recordStartupFailure(error.message).pipe(
+                recordStartupFailure(error.message, config.value).pipe(
                   Effect.flatMap((replace) =>
                     replace ? Effect.forkIn(replaceRun(runId), parentScope) : Effect.void,
                   ),
@@ -1015,28 +1019,37 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
 
   // Counts one startup failure. At the cap, calls onStartupFailed and returns
   // its answer: true when the caller changed the config and the run should be
-  // replaced. Returns false below the cap or when no hook is set.
+  // replaced. Returns false below the cap, once the backend is ready, or when
+  // no hook is set.
   const recordStartupFailure = Effect.fn("desktop.backendInstance.recordStartupFailure")(function* (
     reason: string,
+    config: DesktopBackendStartConfig,
   ) {
     const onStartupFailed = spec.onStartupFailed;
     if (onStartupFailed === undefined) return false;
     const reachedCap = yield* Ref.modify(state, (latest) => {
+      if (latest.ready) return [false, latest] as const;
       const next = latest.startupFailureAttempt + 1;
       return next >= MAX_STARTUP_FAILURE_ATTEMPTS
         ? ([true, { ...latest, startupFailureAttempt: 0 }] as const)
         : ([false, { ...latest, startupFailureAttempt: next }] as const);
     });
     if (!reachedCap) return false;
-    return yield* onStartupFailed(reason);
+    return yield* onStartupFailed(reason, config);
   });
 
-  // Stops the given run (if it is still the active one) and starts again so
-  // configResolve picks up whatever onStartupFailed changed.
+  // Stops the given run (if it is still the active one and never became ready)
+  // and starts again so configResolve picks up whatever onStartupFailed changed.
   const replaceRun = (runId: number): Effect.Effect<void> =>
     Effect.gen(function* () {
       const current = yield* Ref.get(state);
-      if (Option.getOrUndefined(current.active)?.id !== runId || !current.desiredRunning) return;
+      if (
+        Option.getOrUndefined(current.active)?.id !== runId ||
+        !current.desiredRunning ||
+        current.ready
+      ) {
+        return;
+      }
       yield* stop();
       yield* start;
     });

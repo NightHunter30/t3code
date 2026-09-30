@@ -1527,6 +1527,60 @@ describe("DesktopBackendManager", () => {
     ),
   );
 
+  it.effect("keeps a backend that became ready while the startup failure hook was pending", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const hookEntered = yield* Deferred.make<void>();
+        const releaseHook = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        let spawnCount = 0;
+        let reachable = false;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.gen(function* () {
+              spawnCount += 1;
+              const scope = yield* Scope.Scope;
+              const exited = yield* Deferred.make<void>();
+              yield* Scope.addFinalizer(scope, Deferred.succeed(exited, void 0));
+              return makeProcess({
+                exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+                kill: () => Deferred.succeed(exited, void 0).pipe(Effect.asVoid),
+              });
+            }),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          httpClientLayer: httpClientLayer((request) =>
+            Effect.sync(() => responseForRequest(request, reachable ? 200 : 503)),
+          ),
+          onReady: Deferred.succeed(ready, void 0).pipe(Effect.asVoid),
+          onStartupFailed: () =>
+            Deferred.succeed(hookEntered, void 0).pipe(
+              Effect.andThen(Deferred.await(releaseHook)),
+              Effect.as(true),
+            ),
+        });
+
+        yield* instance.start;
+        yield* TestClock.adjust(Duration.minutes(3));
+        yield* Deferred.await(hookEntered);
+
+        reachable = true;
+        yield* TestClock.adjust(Duration.seconds(1));
+        yield* Deferred.await(ready);
+
+        yield* Deferred.succeed(releaseHook, void 0);
+        yield* TestClock.adjust(Duration.seconds(1));
+        assert.equal(spawnCount, 1);
+        assert.equal((yield* instance.snapshot).ready, true);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
   it.effect("surfaces repeated exits before readiness and keeps retrying when declined", () =>
     Effect.scoped(
       Effect.gen(function* () {
