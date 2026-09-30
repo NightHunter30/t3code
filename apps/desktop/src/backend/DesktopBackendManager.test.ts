@@ -1581,6 +1581,111 @@ describe("DesktopBackendManager", () => {
     ),
   );
 
+  it.effect("stop is not held up by a pending startup failure hook after pre-ready exits", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const hookEntered = yield* Deferred.make<void>();
+        const releaseHook = yield* Deferred.make<void>();
+        const exits = yield* Queue.unbounded<void>();
+        let fallbackApplied = false;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              makeProcess({
+                exitCode: Queue.offer(exits, void 0).pipe(
+                  Effect.as(ChildProcessSpawner.ExitCode(1)),
+                ),
+              }),
+            ),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          httpClientLayer: httpClientLayer(() => Effect.never),
+          onStartupFailed: () =>
+            Deferred.succeed(hookEntered, void 0).pipe(
+              Effect.andThen(Deferred.await(releaseHook)),
+              Effect.andThen(
+                Effect.sync(() => {
+                  fallbackApplied = true;
+                }),
+              ),
+              Effect.as(true),
+            ),
+        });
+
+        yield* instance.start;
+        // Pre-ready exits restart after 0.5s and 1s; the third exit hits the cap.
+        yield* Queue.take(exits);
+        yield* TestClock.adjust(Duration.millis(500));
+        yield* Queue.take(exits);
+        yield* TestClock.adjust(Duration.seconds(1));
+        yield* Deferred.await(hookEntered);
+
+        yield* instance.stop();
+        yield* Deferred.succeed(releaseHook, void 0);
+        yield* TestClock.adjust(Duration.seconds(1));
+        assert.equal(fallbackApplied, false);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("does not restart a backend that was stopped while being replaced", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const closing = yield* Queue.unbounded<void>();
+        const releaseClose = yield* Deferred.make<void>();
+        let spawnCount = 0;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.gen(function* () {
+              spawnCount += 1;
+              const scope = yield* Scope.Scope;
+              const exited = yield* Deferred.make<void>();
+              // Closing the run blocks until the test lets it finish.
+              yield* Scope.addFinalizer(
+                scope,
+                Queue.offer(closing, void 0).pipe(
+                  Effect.andThen(Deferred.await(releaseClose)),
+                  Effect.andThen(Deferred.succeed(exited, void 0)),
+                ),
+              );
+              return makeProcess({
+                exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+              });
+            }),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          httpClientLayer: httpClientLayer((request) =>
+            Effect.succeed(responseForRequest(request, 503)),
+          ),
+          onStartupFailed: () => Effect.succeed(true),
+        });
+
+        yield* instance.start;
+        yield* TestClock.adjust(Duration.minutes(3));
+        // The replacement is closing the old run; the user stops the backend now.
+        yield* Queue.take(closing);
+        const userStop = yield* Effect.forkChild(instance.stop());
+        yield* TestClock.adjust(Duration.millis(1));
+        yield* Deferred.succeed(releaseClose, void 0);
+        yield* Fiber.join(userStop);
+        yield* TestClock.adjust(Duration.seconds(1));
+
+        assert.equal(spawnCount, 1);
+        assert.equal((yield* instance.snapshot).desiredRunning, false);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
   it.effect("surfaces repeated exits before readiness and keeps retrying when declined", () =>
     Effect.scoped(
       Effect.gen(function* () {

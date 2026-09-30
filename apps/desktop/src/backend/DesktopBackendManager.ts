@@ -333,6 +333,10 @@ interface BackendManagerState {
   readonly preflightFailureAttempt: number;
   // Consecutive readiness timeouts and pre-ready exits, reset once ready.
   readonly startupFailureAttempt: number;
+  // The pending onStartupFailed call, interrupted by stop().
+  readonly startupFailureFiber: Option.Option<Fiber.Fiber<void, never>>;
+  // Bumped by every stop(), so a replacement can tell it was stopped meanwhile.
+  readonly stopGeneration: number;
   readonly restartFiber: Option.Option<Fiber.Fiber<void, never>>;
   readonly nextRunId: number;
 }
@@ -345,6 +349,8 @@ const initialState: BackendManagerState = {
   restartAttempt: 0,
   preflightFailureAttempt: 0,
   startupFailureAttempt: 0,
+  startupFailureFiber: Option.none(),
+  stopGeneration: 0,
   restartFiber: Option.none(),
   nextRunId: 1,
 };
@@ -913,10 +919,16 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
                 }
               }
 
-              if (isCurrentRun && exitObserved && !stopRequested && !wasReady) {
-                // The restart below re-resolves config, so the hook's answer
-                // needs no extra handling here.
-                yield* recordStartupFailure(reason, config.value);
+              if (
+                isCurrentRun &&
+                exitObserved &&
+                !stopRequested &&
+                !wasReady &&
+                (yield* countStartupFailure)
+              ) {
+                // The restart below re-resolves config, so there is no run to
+                // replace here.
+                yield* surfaceStartupFailure(reason, config.value, Option.none());
               }
               if (isCurrentRun && nextState.desiredRunning) {
                 yield* scheduleRestart(reason);
@@ -984,16 +996,16 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               yield* backendOutputLog.persistFailureSnapshot({
                 details: error.message,
               });
-              // Stopping the run interrupts the pending hook. The replacement
-              // goes to the instance scope because it closes this run's scope.
-              yield* Effect.forkIn(
-                recordStartupFailure(error.message, config.value).pipe(
-                  Effect.flatMap((replace) =>
-                    replace ? Effect.forkIn(replaceRun(runId), parentScope) : Effect.void,
-                  ),
-                ),
-                runScope,
-              );
+              if (yield* countStartupFailure) {
+                yield* mutex.withPermits(1)(
+                  Effect.gen(function* () {
+                    const current = yield* Ref.get(state);
+                    if (Option.getOrUndefined(current.active)?.id !== runId) return;
+                    if (!current.desiredRunning) return;
+                    yield* surfaceStartupFailure(error.message, config.value, Option.some(runId));
+                  }),
+                );
+              }
             },
           ),
           onOutput: (streamName, chunk) => backendOutputLog.writeOutputChunk(streamName, chunk),
@@ -1017,29 +1029,49 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
     ),
   ).pipe(Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }));
 
-  // Counts one startup failure. At the cap, calls onStartupFailed and returns
-  // its answer: true when the caller changed the config and the run should be
-  // replaced. Returns false below the cap, once the backend is ready, or when
-  // no hook is set.
-  const recordStartupFailure = Effect.fn("desktop.backendInstance.recordStartupFailure")(function* (
+  // Counts one startup failure and reports whether it reached the cap. Never
+  // counts without a hook or once the backend is ready.
+  const countStartupFailure: Effect.Effect<boolean> = Ref.modify(state, (latest) => {
+    if (spec.onStartupFailed === undefined || latest.ready) return [false, latest] as const;
+    const next = latest.startupFailureAttempt + 1;
+    return next >= MAX_STARTUP_FAILURE_ATTEMPTS
+      ? ([true, { ...latest, startupFailureAttempt: 0 }] as const)
+      : ([false, { ...latest, startupFailureAttempt: next }] as const);
+  });
+
+  // Runs onStartupFailed on its own fiber so it never holds the mutex and
+  // stop() can interrupt it. Callers hold the mutex, so the fiber is recorded
+  // before any stop() can look for it. If the hook changed the config, the
+  // given run is replaced.
+  const surfaceStartupFailure = (
     reason: string,
     config: DesktopBackendStartConfig,
-  ) {
-    const onStartupFailed = spec.onStartupFailed;
-    if (onStartupFailed === undefined) return false;
-    const reachedCap = yield* Ref.modify(state, (latest) => {
-      if (latest.ready) return [false, latest] as const;
-      const next = latest.startupFailureAttempt + 1;
-      return next >= MAX_STARTUP_FAILURE_ATTEMPTS
-        ? ([true, { ...latest, startupFailureAttempt: 0 }] as const)
-        : ([false, { ...latest, startupFailureAttempt: next }] as const);
+    runToReplace: Option.Option<number>,
+  ): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const onStartupFailed = spec.onStartupFailed;
+      if (onStartupFailed === undefined) return;
+      const fiber = yield* Effect.forkIn(
+        onStartupFailed(reason, config).pipe(
+          Effect.flatMap((replace) =>
+            replace && Option.isSome(runToReplace)
+              ? Effect.forkIn(replaceRun(runToReplace.value), parentScope)
+              : Effect.void,
+          ),
+          Effect.asVoid,
+        ),
+        parentScope,
+      );
+      const previous = yield* Ref.modify(state, (latest) => [
+        latest.startupFailureFiber,
+        { ...latest, startupFailureFiber: Option.some(fiber) },
+      ]);
+      if (Option.isSome(previous)) yield* Fiber.interrupt(previous.value);
     });
-    if (!reachedCap) return false;
-    return yield* onStartupFailed(reason, config);
-  });
 
   // Stops the given run (if it is still the active one and never became ready)
   // and starts again so configResolve picks up whatever onStartupFailed changed.
+  // Starts only if nothing else stopped the instance in the meantime.
   const replaceRun = (runId: number): Effect.Effect<void> =>
     Effect.gen(function* () {
       const current = yield* Ref.get(state);
@@ -1051,6 +1083,8 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
         return;
       }
       yield* stop();
+      const after = yield* Ref.get(state);
+      if (after.stopGeneration !== current.stopGeneration + 1) return;
       yield* start;
     });
 
@@ -1117,7 +1151,9 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
   const stop = Effect.fn("desktop.backendInstance.stop")(function* (options?: {
     readonly timeout?: Duration.Duration;
   }) {
-    const { active, restartFiber, notifyShutdown } = yield* mutex.withPermits(1)(
+    const { active, restartFiber, startupFailureFiber, notifyShutdown } = yield* mutex.withPermits(
+      1,
+    )(
       Effect.gen(function* () {
         const result = yield* Ref.modify(state, (latest) => {
           const active = Option.map(latest.active, (run) =>
@@ -1127,6 +1163,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
             {
               active,
               restartFiber: latest.restartFiber,
+              startupFailureFiber: latest.startupFailureFiber,
               notifyShutdown: latest.ready,
             },
             {
@@ -1135,6 +1172,8 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               ready: false,
               active,
               restartFiber: Option.none<Fiber.Fiber<void, never>>(),
+              startupFailureFiber: Option.none<Fiber.Fiber<void, never>>(),
+              stopGeneration: latest.stopGeneration + 1,
             },
           ] as const;
         });
@@ -1146,6 +1185,10 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       yield* (spec.onShutdown?.() ?? Effect.void).pipe(Effect.ignore);
     }
     yield* Option.match(restartFiber, {
+      onNone: () => Effect.void,
+      onSome: (fiber) => Fiber.interrupt(fiber).pipe(Effect.asVoid),
+    });
+    yield* Option.match(startupFailureFiber, {
       onNone: () => Effect.void,
       onSome: (fiber) => Fiber.interrupt(fiber).pipe(Effect.asVoid),
     });
