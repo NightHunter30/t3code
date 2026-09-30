@@ -1476,6 +1476,57 @@ describe("DesktopBackendManager", () => {
       ),
   );
 
+  it.effect("stopping the backend cancels a pending startup failure hook", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const hookEntered = yield* Deferred.make<void>();
+        const releaseHook = yield* Deferred.make<void>();
+        let fallbackApplied = false;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.gen(function* () {
+              const scope = yield* Scope.Scope;
+              const exited = yield* Deferred.make<void>();
+              yield* Scope.addFinalizer(scope, Deferred.succeed(exited, void 0));
+              return makeProcess({
+                exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+                kill: () => Deferred.succeed(exited, void 0).pipe(Effect.asVoid),
+              });
+            }),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          httpClientLayer: httpClientLayer((request) =>
+            Effect.succeed(responseForRequest(request, 503)),
+          ),
+          onStartupFailed: () =>
+            Deferred.succeed(hookEntered, void 0).pipe(
+              Effect.andThen(Deferred.await(releaseHook)),
+              Effect.andThen(
+                Effect.sync(() => {
+                  fallbackApplied = true;
+                }),
+              ),
+              Effect.as(true),
+            ),
+        });
+
+        yield* instance.start;
+        yield* TestClock.adjust(Duration.minutes(3));
+        yield* Deferred.await(hookEntered);
+
+        yield* instance.stop();
+        yield* Deferred.succeed(releaseHook, void 0);
+        yield* TestClock.adjust(Duration.seconds(1));
+        assert.equal(fallbackApplied, false);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
   it.effect("surfaces repeated exits before readiness and keeps retrying when declined", () =>
     Effect.scoped(
       Effect.gen(function* () {

@@ -980,12 +980,15 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               yield* backendOutputLog.persistFailureSnapshot({
                 details: error.message,
               });
-              // Forked into the instance scope: replacing the run closes this one.
+              // Stopping the run interrupts the pending hook. The replacement
+              // goes to the instance scope because it closes this run's scope.
               yield* Effect.forkIn(
                 recordStartupFailure(error.message).pipe(
-                  Effect.flatMap((replace) => (replace ? replaceRun(runId) : Effect.void)),
+                  Effect.flatMap((replace) =>
+                    replace ? Effect.forkIn(replaceRun(runId), parentScope) : Effect.void,
+                  ),
                 ),
-                parentScope,
+                runScope,
               );
             },
           ),
