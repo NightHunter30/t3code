@@ -277,6 +277,27 @@ export const layer = Layer.effect(
       },
     );
 
+    // The WSL primary passed preflight but keeps failing to become ready. The
+    // splash has no way to reach Settings, so use Windows for this launch, as
+    // the bounded preflight path does. A Windows primary has nothing to fall
+    // back to and keeps retrying.
+    const handlePrimaryStartupFailure = Effect.fn("desktop.backendPool.primaryStartupFailed")(
+      function* (reason: string) {
+        const settings = yield* appSettings.get;
+        if (!settings.wslOnly || !settings.wslBackendEnabled) return false;
+        yield* logBackendPoolWarning(
+          "primary WSL backend did not become ready; using Windows for this launch",
+          { reason },
+        );
+        yield* electronDialog.showErrorBox(
+          "WSL backend isn't responding",
+          `${reason}\n\nT3 Code will use the Windows backend for this launch and retry WSL the next time the app starts.`,
+        );
+        yield* appSettings.applyWslWindowsFallbackInMemory;
+        return true;
+      },
+    );
+
     const primary = yield* DesktopBackendManager.makeBackendInstance({
       id: DesktopBackendManager.PRIMARY_INSTANCE_ID,
       // Keep this lazy. The pool layer is initialized before startup loads
@@ -301,6 +322,7 @@ export const layer = Layer.effect(
         ),
       onShutdown: () => desktopWindow.handleBackendNotReady,
       onPreflightFailed: handlePrimaryPreflightFailure,
+      onStartupFailed: handlePrimaryStartupFailure,
     });
 
     const instancesRef = yield* SynchronizedRef.make<

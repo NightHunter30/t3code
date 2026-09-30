@@ -61,6 +61,9 @@ const MAX_RESTART_DELAY = Duration.seconds(10);
 // failures may instead provide their own larger retryLimit when they should
 // self-heal for a while but must not leave the app connecting forever.
 const MAX_PREFLIGHT_FAILURE_ATTEMPTS = 5;
+// Consecutive readiness timeouts or pre-ready exits before onStartupFailed
+// fires. Three one-minute readiness rounds still cover a slow WSL cold boot.
+const MAX_STARTUP_FAILURE_ATTEMPTS = 3;
 const DEFAULT_BACKEND_READINESS_TIMEOUT = Duration.minutes(1);
 const DEFAULT_BACKEND_READINESS_INTERVAL = Duration.millis(100);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT = Duration.seconds(1);
@@ -299,6 +302,11 @@ export interface BackendInstanceSpec {
   // retries. Returns true when the callback changed configuration and the
   // manager should resolve once more; false stops the failed instance.
   readonly onPreflightFailed?: (failure: PreflightFailure) => Effect.Effect<boolean>;
+  // Fired each time MAX_STARTUP_FAILURE_ATTEMPTS consecutive startup failures
+  // accumulate after a clean preflight. Returns true when the callback changed
+  // configuration and the manager should replace the current run; false keeps
+  // the normal restart and readiness loops going.
+  readonly onStartupFailed?: (reason: string) => Effect.Effect<boolean>;
 }
 
 interface ActiveBackendRun {
@@ -319,6 +327,8 @@ interface BackendManagerState {
   // Consecutive bounded/fatal preflight failures, reset on a clean or
   // unbounded-transient preflight. restartAttempt counts all restarts.
   readonly preflightFailureAttempt: number;
+  // Consecutive readiness timeouts and pre-ready exits, reset once ready.
+  readonly startupFailureAttempt: number;
   readonly restartFiber: Option.Option<Fiber.Fiber<void, never>>;
   readonly nextRunId: number;
 }
@@ -330,6 +340,7 @@ const initialState: BackendManagerState = {
   active: Option.none(),
   restartAttempt: 0,
   preflightFailureAttempt: 0,
+  startupFailureAttempt: 0,
   restartFiber: Option.none(),
   nextRunId: 1,
 };
@@ -735,6 +746,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
           ready: false,
           config: Option.some(config.value),
           preflightFailureAttempt: resetFatalPreflightCounter ? 0 : latest.preflightFailureAttempt,
+          startupFailureAttempt: current.desiredRunning ? latest.startupFailureAttempt : 0,
         }));
 
         const preflightFailure = config.value.preflightFailure;
@@ -897,6 +909,11 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
                 }
               }
 
+              if (isCurrentRun && exitObserved && !stopRequested && !wasReady) {
+                // The restart below re-resolves config, so the hook's answer
+                // needs no extra handling here.
+                yield* recordStartupFailure(reason);
+              }
               if (isCurrentRun && nextState.desiredRunning) {
                 yield* scheduleRestart(reason);
               }
@@ -935,6 +952,7 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
                 {
                   ...latest,
                   restartAttempt: 0,
+                  startupFailureAttempt: 0,
                   ready: true,
                 },
               ] as const;
@@ -962,6 +980,13 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
               yield* backendOutputLog.persistFailureSnapshot({
                 details: error.message,
               });
+              // Forked into the instance scope: replacing the run closes this one.
+              yield* Effect.forkIn(
+                recordStartupFailure(error.message).pipe(
+                  Effect.flatMap((replace) => (replace ? replaceRun(runId) : Effect.void)),
+                ),
+                parentScope,
+              );
             },
           ),
           onOutput: (streamName, chunk) => backendOutputLog.writeOutputChunk(streamName, chunk),
@@ -984,6 +1009,34 @@ export const makeBackendInstance = Effect.fn("makeBackendInstance")(function* (
       }),
     ),
   ).pipe(Effect.withSpan("desktop.backendInstance.start", { attributes: { id: spec.id } }));
+
+  // Counts one startup failure. At the cap, calls onStartupFailed and returns
+  // its answer: true when the caller changed the config and the run should be
+  // replaced. Returns false below the cap or when no hook is set.
+  const recordStartupFailure = Effect.fn("desktop.backendInstance.recordStartupFailure")(function* (
+    reason: string,
+  ) {
+    const onStartupFailed = spec.onStartupFailed;
+    if (onStartupFailed === undefined) return false;
+    const reachedCap = yield* Ref.modify(state, (latest) => {
+      const next = latest.startupFailureAttempt + 1;
+      return next >= MAX_STARTUP_FAILURE_ATTEMPTS
+        ? ([true, { ...latest, startupFailureAttempt: 0 }] as const)
+        : ([false, { ...latest, startupFailureAttempt: next }] as const);
+    });
+    if (!reachedCap) return false;
+    return yield* onStartupFailed(reason);
+  });
+
+  // Stops the given run (if it is still the active one) and starts again so
+  // configResolve picks up whatever onStartupFailed changed.
+  const replaceRun = (runId: number): Effect.Effect<void> =>
+    Effect.gen(function* () {
+      const current = yield* Ref.get(state);
+      if (Option.getOrUndefined(current.active)?.id !== runId || !current.desiredRunning) return;
+      yield* stop();
+      yield* start;
+    });
 
   const scheduleRestart = Effect.fn("desktop.backendInstance.scheduleRestart")(function* (
     reason: string,

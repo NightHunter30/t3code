@@ -126,6 +126,7 @@ interface MakeInstanceInput {
   readonly onPreflightFailed?: (
     failure: DesktopBackendManager.PreflightFailure,
   ) => Effect.Effect<boolean>;
+  readonly onStartupFailed?: (reason: string) => Effect.Effect<boolean>;
   readonly config?: DesktopBackendManager.DesktopBackendStartConfig;
   readonly configResolve?: Effect.Effect<
     DesktopBackendManager.DesktopBackendStartConfig,
@@ -185,6 +186,7 @@ function makeTestInstance(input: MakeInstanceInput) {
     ...(input.onReady ? { onReady: () => input.onReady! } : {}),
     ...(input.onShutdown ? { onShutdown: () => input.onShutdown! } : {}),
     ...(input.onPreflightFailed ? { onPreflightFailed: input.onPreflightFailed } : {}),
+    ...(input.onStartupFailed ? { onStartupFailed: input.onStartupFailed } : {}),
   });
 
   return instance.pipe(Effect.provide(servicesLayer));
@@ -1395,6 +1397,167 @@ describe("DesktopBackendManager", () => {
 
         yield* TestClock.adjust(Duration.seconds(1));
         assert.deepEqual(failures, ["WSL toolchain probe timed out"]);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect(
+    "replaces a live run that never becomes reachable once startup failures hit the cap",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          // Models wsl-only mode where the WSL backend is alive but the desktop
+          // probes an address Windows cannot reach. The fallback hook flips the
+          // resolved config to a reachable (Windows) primary.
+          const wslConfig: DesktopBackendManager.DesktopBackendStartConfig = {
+            ...baseConfig,
+            httpBaseUrl: new URL("http://172.17.0.1:3773"),
+          };
+          const useFallback = yield* Ref.make(false);
+          const startupFailures: string[] = [];
+          const spawnedUrls = yield* Queue.unbounded<string>();
+          const ready = yield* Deferred.make<void>();
+          let currentUrl = "";
+
+          const spawnerLayer = Layer.succeed(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make(() =>
+              Effect.gen(function* () {
+                const scope = yield* Scope.Scope;
+                const exited = yield* Deferred.make<void>();
+                yield* Queue.offer(spawnedUrls, currentUrl);
+                yield* Scope.addFinalizer(scope, Deferred.succeed(exited, void 0));
+                return makeProcess({
+                  exitCode: Deferred.await(exited).pipe(Effect.as(ChildProcessSpawner.ExitCode(0))),
+                  kill: () => Deferred.succeed(exited, void 0).pipe(Effect.asVoid),
+                });
+              }),
+            ),
+          );
+
+          const instance = yield* makeTestInstance({
+            spawnerLayer,
+            configResolve: Ref.get(useFallback).pipe(
+              Effect.map((fallback) => (fallback ? baseConfig : wslConfig)),
+              Effect.tap((config) =>
+                Effect.sync(() => {
+                  currentUrl = config.httpBaseUrl.href;
+                }),
+              ),
+            ),
+            // Only the Windows loopback endpoint answers.
+            httpClientLayer: httpClientLayer((request) =>
+              Effect.succeed(
+                responseForRequest(request, request.url.startsWith("http://127.0.0.1") ? 200 : 503),
+              ),
+            ),
+            onReady: Deferred.succeed(ready, void 0).pipe(Effect.asVoid),
+            onStartupFailed: (reason) =>
+              Effect.sync(() => {
+                startupFailures.push(reason);
+              }).pipe(Effect.andThen(Ref.set(useFallback, true)), Effect.as(true)),
+          });
+
+          yield* instance.start;
+          assert.equal(yield* Queue.take(spawnedUrls), "http://172.17.0.1:3773/");
+
+          // Two unreachable readiness rounds are tolerated (slow WSL cold boot).
+          yield* TestClock.adjust(Duration.minutes(2));
+          assert.deepEqual(startupFailures, []);
+          assert.equal(yield* Queue.size(spawnedUrls), 0);
+
+          // The third round surfaces the failure once and swaps the run.
+          yield* TestClock.adjust(Duration.minutes(1));
+          assert.equal(yield* Queue.take(spawnedUrls), "http://127.0.0.1:3773/");
+          yield* Deferred.await(ready);
+          assert.equal(startupFailures.length, 1);
+          assert.equal((yield* instance.snapshot).ready, true);
+        }).pipe(Effect.provide(TestClock.layer())),
+      ),
+  );
+
+  it.effect("surfaces repeated exits before readiness and keeps retrying when declined", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const starts = yield* Queue.unbounded<number>();
+        const startupFailures = yield* Queue.unbounded<string>();
+        let startCount = 0;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.sync(() => {
+              startCount += 1;
+              return makeProcess({
+                exitCode: Queue.offer(starts, startCount).pipe(
+                  Effect.as(ChildProcessSpawner.ExitCode(1)),
+                ),
+              });
+            }),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          httpClientLayer: httpClientLayer(() => Effect.never),
+          onStartupFailed: (reason) => Queue.offer(startupFailures, reason).pipe(Effect.as(false)),
+        });
+
+        yield* instance.start;
+        assert.equal(yield* Queue.take(starts), 1);
+        yield* TestClock.adjust(Duration.millis(500));
+        assert.equal(yield* Queue.take(starts), 2);
+        assert.equal(yield* Queue.size(startupFailures), 0);
+
+        // The third exit before the backend ever became ready hits the cap.
+        yield* TestClock.adjust(Duration.seconds(1));
+        assert.equal(yield* Queue.take(starts), 3);
+        yield* Queue.take(startupFailures);
+
+        // Declined (e.g. a Windows primary): the restart loop carries on.
+        yield* TestClock.adjust(Duration.seconds(2));
+        assert.equal(yield* Queue.take(starts), 4);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
+  it.effect("does not surface exits that happen after the backend became ready", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const readied = yield* Queue.unbounded<void>();
+        const exits = yield* Queue.unbounded<string>();
+        let startupFailures = 0;
+
+        const spawnerLayer = Layer.succeed(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.make(() =>
+            Effect.succeed(
+              makeProcess({
+                // Each run crashes only after it has reported ready.
+                exitCode: Queue.take(readied).pipe(Effect.as(ChildProcessSpawner.ExitCode(1))),
+              }),
+            ),
+          ),
+        );
+
+        const instance = yield* makeTestInstance({
+          spawnerLayer,
+          onReady: Queue.offer(readied, void 0).pipe(Effect.asVoid),
+          onStartupFailed: () =>
+            Effect.sync(() => {
+              startupFailures += 1;
+            }).pipe(Effect.as(false)),
+          backendOutputLog: {
+            persistFailure: ({ details }) => Queue.offer(exits, details).pipe(Effect.asVoid),
+          },
+        });
+
+        yield* instance.start;
+        for (let i = 0; i < 5; i++) {
+          yield* Queue.take(exits);
+          yield* TestClock.adjust(Duration.seconds(1));
+        }
+        assert.equal(startupFailures, 0);
       }).pipe(Effect.provide(TestClock.layer())),
     ),
   );
